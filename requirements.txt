@@ -4,3 +4,8 @@ numpy
 matplotlib
 seaborn
 joblib
+typing
+pydantic
+scipy
+uvicorn
+scikit-learn
