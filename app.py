@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from typing import List, Dict
+from typing import Dict
 import pandas as pd
 import numpy as np
 from scipy.stats import zscore
@@ -7,10 +7,12 @@ from scipy.signal import medfilt
 
 app = FastAPI()
 
-
-def load_and_preprocess_data(data: List[Dict]):
-    df = pd.DataFrame(data)
-    return df
+def load_and_preprocess_data(data: Dict):
+    try:
+        df = pd.DataFrame(data)
+        return df
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid DataFrame format: {str(e)}")
 
 
 def hampel_filter(series, window_size=7, n_sigma=3):
@@ -24,6 +26,12 @@ def detect_anomalies(df):
     df["z_score"] = np.abs(zscore(df["meanpressure"]))
     df["z_anomaly"] = df["z_score"] > 3
 
+    window = 7
+    df["rolling_mean"] = df["meanpressure"].rolling(window).mean()
+    df["rolling_std"] = df["meanpressure"].rolling(window).std()
+    df["ma_anomaly"] = (df["meanpressure"] > df["rolling_mean"] + 2 * df["rolling_std"]) | \
+                       (df["meanpressure"] < df["rolling_mean"] - 2 * df["rolling_std"])
+
     Q1 = df["meanpressure"].quantile(0.25)
     Q3 = df["meanpressure"].quantile(0.75)
     IQR = Q3 - Q1
@@ -31,7 +39,7 @@ def detect_anomalies(df):
 
     df["hampel_anomaly"] = hampel_filter(df["meanpressure"])
 
-    methods = ["z_anomaly", "iqr_anomaly", "hampel_anomaly"]
+    methods = ["z_anomaly", "ma_anomaly", "iqr_anomaly", "hampel_anomaly"]
     summary = {method: int(df[method].sum()) for method in methods}
     best_method = max(summary, key=summary.get)
     
@@ -39,7 +47,7 @@ def detect_anomalies(df):
 
 
 @app.post("/detect-anomalies")
-async def detect_anomalies_api(data: List[Dict]):
+async def detect_anomalies_api(data: Dict):
     try:
         df = load_and_preprocess_data(data)
         df, summary, best_method = detect_anomalies(df)
@@ -62,4 +70,5 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
-# Now, you can hit the endpoint with JSON data directly! 🚀
+
+# Now you can send your DataFrame as JSON directly to the API! 🚀
