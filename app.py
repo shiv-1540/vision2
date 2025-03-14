@@ -1,90 +1,81 @@
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Dict
 import pandas as pd
 import numpy as np
-import joblib
-from sklearn.ensemble import IsolationForest
-from sklearn.cluster import DBSCAN
 from scipy.stats import zscore
+from scipy.signal import medfilt
 
-app = Flask(__name__)
+app = FastAPI()
 
-# Load the pre-trained model (ensure you've trained and saved this beforehand)
-try:
-    iso_forest = joblib.load("model/isolation.joblib")
-except FileNotFoundError:
-    iso_forest = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
-    
+class DataPoint(BaseModel):
+    date: str
+    meantemp: float
+    humidity: float
+    wind_speed: float
+    meanpressure: float
 
-def load_and_preprocess_data(data):
-    """Load and clean incoming data."""
+class AnomalyDetectionRequest(BaseModel):
+    data: List[DataPoint]
+
+
+def load_and_preprocess_data(data: List[Dict]):
     df = pd.DataFrame(data)
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    df.dropna(subset=['date'], inplace=True)
-    df.fillna(method='ffill', inplace=True)
     return df
 
 
-def feature_engineering(df):
-    """Add useful features for anomaly detection."""
-    df['rolling_mean'] = df['meantemp'].rolling(window=7).mean().fillna(df['meantemp'])
-    df['z_score'] = zscore(df['meantemp'], nan_policy='omit')
-    return df
+def hampel_filter(series, window_size=7, n_sigma=3):
+    median_filtered = medfilt(series, kernel_size=window_size)
+    std_dev = np.std(series - median_filtered)
+    outliers = np.abs(series - median_filtered) > n_sigma * std_dev
+    return outliers
 
 
 def detect_anomalies(df):
-    """Apply anomaly detection algorithms."""
-    df['iso_anomaly'] = iso_forest.predict(df[['meantemp', 'humidity', 'wind_speed', 'meanpressure']])
-    df['dbscan_anomaly'] = DBSCAN(eps=5, min_samples=2).fit_predict(df[['meantemp', 'humidity', 'wind_speed', 'meanpressure']])
-    df['z_anomaly'] = (np.abs(df['z_score']) > 2).astype(int)
+    df["z_score"] = np.abs(zscore(df["meantemp"]))
+    df["z_anomaly"] = df["z_score"] > 3
 
-    # Consolidate anomalies
-    df['is_anomaly'] = (df['iso_anomaly'] == -1) | (df['dbscan_anomaly'] == -1) | (df['z_anomaly'] == 1)
-    return df
+    window = 7
+    df["rolling_mean"] = df["meantemp"].rolling(window).mean()
+    df["rolling_std"] = df["meantemp"].rolling(window).std()
+    df["ma_anomaly"] = (df["meantemp"] > df["rolling_mean"] + 2 * df["rolling_std"]) | \
+                       (df["meantemp"] < df["rolling_mean"] - 2 * df["rolling_std"])
+
+    Q1 = df["meantemp"].quantile(0.25)
+    Q3 = df["meantemp"].quantile(0.75)
+    IQR = Q3 - Q1
+    df["iqr_anomaly"] = (df["meantemp"] < (Q1 - 1.5 * IQR)) | (df["meantemp"] > (Q3 + 1.5 * IQR))
+
+    df["hampel_anomaly"] = hampel_filter(df["meantemp"])
+
+    methods = ["z_anomaly", "ma_anomaly", "iqr_anomaly", "hampel_anomaly"]
+    summary = {method: int(df[method].sum()) for method in methods}
+    best_method = max(summary, key=summary.get)
+    
+    return df, summary, best_method
 
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    """Handle incoming data and detect anomalies."""
+@app.post("/detect-anomalies")
+async def detect_anomalies_api(request: AnomalyDetectionRequest):
     try:
-        data = request.get_json()
+        df = load_and_preprocess_data([item.dict() for item in request.data])
+        df, summary, best_method = detect_anomalies(df)
         
-        if not data or 'data' not in data:
-            return jsonify({"error": "Invalid input format. Send data as JSON."}), 400
-        
-        df = load_and_preprocess_data(data['data'])
-        df = feature_engineering(df)
-        df = detect_anomalies(df)
-
-        anomalies = df[df['is_anomaly']]
-
-        return jsonify({
-            "total_records": len(df),
-            "anomalies_detected": len(anomalies),
-            "anomaly_percentage": (len(anomalies) / len(df)) * 100,
-            "anomalies": anomalies.to_dict(orient='records')
-        })
+        return {
+            "anomalies_detected": summary,
+            "best_performing_method": best_method,
+            "anomaly_records": df[df[list(summary.keys())].any(axis=1)].reset_index().to_dict(orient='records')
+        }
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.route('/fetch-results', methods=['GET'])
-def fetch_results():
-    """Fetch previously detected anomalies from file."""
-    try:
-        df = pd.read_csv("detected_anomalies_weather.csv")
-        return df.to_json(orient='records')
-    except FileNotFoundError:
-        return jsonify({"error": "No results found, please upload and process data first."}), 404
+@app.get("/test")
+async def test_api():
+    return {"message": "API is working!"}
 
 
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
-
-# Fixes applied:
-# 1. Corrected the IsolationForest model loading logic with fallback.
-# 2. Fixed DBSCAN parameters to avoid clustering issues.
-# 3. Added safe handling for NaNs in z-score.
-# 4. Proper error messages and status codes for invalid requests.
-
-# Your API should now be ready to handle the weather data and detect anomalies smoothly! 🚀
