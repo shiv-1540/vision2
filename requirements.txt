@@ -9,3 +9,4 @@ pydantic
 scipy
 uvicorn
 scikit-learn
+fastapi
